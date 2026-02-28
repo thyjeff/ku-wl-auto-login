@@ -12,7 +12,7 @@ Open **PowerShell as Administrator** (right-click Start → "Windows PowerShell 
 
 **Step 1: Download the script**
 ```powershell
-Invoke-WebRequest -Uri "https://raw.githubusercontent.com/thyjeff/ku-wl-auto-login/main/ku-wl-auto-login.ps1" -OutFile "$env:USERPROFILE\ku-wl-auto-login.ps1"
+Invoke-WebRequest -Uri "https://raw.githubusercontent.com/thyjeff/ku-wl-auto-login/master/ku-wl-auto-login.ps1" -OutFile "$env:USERPROFILE\ku-wl-auto-login.ps1"
 ```
 
 **Step 2: Install**
