@@ -1,7 +1,7 @@
 # ============================================================
 #  KU-WL Auto Login
 #  Auto-login to Karunya University Wi-Fi (FortiGate Portal)
-#  https://github.com/jefflthyagu/ku-wl-auto-login
+#  https://github.com/thyjeff/ku-wl-auto-login
 # ============================================================
 
 param(
@@ -14,7 +14,7 @@ param(
     [switch]$Status,
     [switch]$Test,
     [switch]$Logs,
-    [int]$Interval = 15
+    [int]$Interval = 10
 )
 
 # --- Configuration ---
@@ -27,6 +27,7 @@ $ENV_FILE        = Join-Path $INSTALL_DIR ".env"
 $LOG_DIR         = Join-Path $INSTALL_DIR "logs"
 $LOG_FILE        = Join-Path $LOG_DIR "autologin.log"
 $SCRIPT_DEST     = Join-Path $INSTALL_DIR "ku-wl-auto-login.ps1"
+$VBS_LAUNCHER    = Join-Path $INSTALL_DIR "silent-launch.vbs"
 
 # ===================== HELPERS =====================
 
@@ -99,39 +100,29 @@ function Load-Credentials {
 function Save-Credentials {
     param([string]$SeraphId, [string]$Password)
     if (-not (Test-Path $INSTALL_DIR)) { New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null }
-    $content = "# KU-WL Credentials (stored locally, never uploaded)`nSERAPH_ID=$SeraphId`nPASSWORD=$Password"
+    $content = "# KU-WL Credentials (local only)`nSERAPH_ID=$SeraphId`nPASSWORD=$Password"
     Set-Content -Path $ENV_FILE -Value $content -Encoding UTF8
-    # Hide the file
     (Get-Item $ENV_FILE).Attributes = 'Hidden'
 }
 
 function Prompt-Credentials {
     Write-Host ""
     Write-Host "  ========================================" -ForegroundColor Cyan
-    Write-Host "  KU-WL Auto Login - First Time Setup" -ForegroundColor Cyan
+    Write-Host "  KU-WL Auto Login - Setup" -ForegroundColor Cyan
     Write-Host "  ========================================" -ForegroundColor Cyan
     Write-Host ""
     Write-Host "  Enter your Seraph portal credentials."
-    Write-Host "  These are stored ONLY on your computer."
+    Write-Host "  Stored ONLY on this computer."
     Write-Host ""
-
     $id = Read-Host "  Seraph ID (e.g. URK25XX0000)"
-    if ([string]::IsNullOrWhiteSpace($id)) {
-        Write-Err "Seraph ID cannot be empty."; return $false
-    }
-
+    if ([string]::IsNullOrWhiteSpace($id)) { Write-Err "Cancelled."; return $false }
     $secPass = Read-Host "  Password" -AsSecureString
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass)
     $pass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
-
-    if ([string]::IsNullOrWhiteSpace($pass)) {
-        Write-Err "Password cannot be empty."; return $false
-    }
-
+    if ([string]::IsNullOrWhiteSpace($pass)) { Write-Err "Cancelled."; return $false }
     Save-Credentials -SeraphId $id -Password $pass
     Write-Ok "Credentials saved!"
-    Write-Host ""
     return $true
 }
 
@@ -146,7 +137,7 @@ function Get-CaptivePortalUrl {
     )
     foreach ($u in $urls) {
         try {
-            $r = Invoke-WebRequest -Uri $u -TimeoutSec 8 `
+            $r = Invoke-WebRequest -Uri $u -TimeoutSec 6 `
                  -UseBasicParsing -MaximumRedirection 5 -ErrorAction Stop
             $final = $r.BaseResponse.ResponseUri.ToString()
             if ($final -match "seraph\.karunya\.edu") { return $final }
@@ -164,38 +155,27 @@ function Get-CaptivePortalUrl {
 function Invoke-PortalLogin {
     param($Creds)
     Enable-SSLBypass
-
     $portalUrl = Get-CaptivePortalUrl
     if (-not $portalUrl) { $portalUrl = $PORTAL_BASE }
     Write-Log "Portal: $portalUrl"
-
     try {
         $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
         $page = Invoke-WebRequest -Uri $portalUrl -WebSession $session `
                 -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
         $html = $page.Content
-
-        # Extract magic token
         $magic = ""
         if ($html -match 'name=[''"]magic[''"][^>]*value=[''"]([^''"]+)[''"]') { $magic = $Matches[1] }
         elseif ($html -match 'value=[''"]([^''"]+)[''"][^>]*name=[''"]magic[''"]') { $magic = $Matches[1] }
-
-        # Extract form action
         $postUrl = $portalUrl
         if ($html -match '<form[^>]*action=[''"]([^''"]+)[''"]') {
             $action = $Matches[1]
             if ($action -match "^https?://") { $postUrl = $action }
             elseif ($action -match "^/") {
-                $uri = [Uri]$portalUrl
-                $postUrl = "$($uri.Scheme)://$($uri.Authority)$action"
+                $uri = [Uri]$portalUrl; $postUrl = "$($uri.Scheme)://$($uri.Authority)$action"
             } else { $postUrl = ([Uri]::new([Uri]$portalUrl, $action)).AbsoluteUri }
         }
-
-        # Build POST body
         $body = @{ username = $Creds["SERAPH_ID"]; password = $Creds["PASSWORD"] }
         if ($magic) { $body["magic"] = $magic }
-
-        # Grab hidden fields
         $hiddens = [regex]::Matches($html, '<input[^>]*type=[''"]hidden[''"][^>]*>')
         foreach ($m in $hiddens) {
             $fn = ""; $fv = ""
@@ -203,16 +183,10 @@ function Invoke-PortalLogin {
             if ($m.Value -match 'value=[''"]([^''"]*)[''"]') { $fv = $Matches[1] }
             if ($fn -and -not $body.ContainsKey($fn)) { $body[$fn] = $fv }
         }
-
-        Write-Log "POST -> $postUrl (fields: $($body.Keys -join ', '))"
-        $response = Invoke-WebRequest -Uri $postUrl -Method POST -Body $body `
-                    -WebSession $session -TimeoutSec 15 -UseBasicParsing `
-                    -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop
-
-        if ($response.Content -match "authentication failed|Authentication Failed|Invalid") {
-            Write-Log "AUTH FAILED"
-            return $false
-        }
+        Write-Log "POST -> $postUrl"
+        Invoke-WebRequest -Uri $postUrl -Method POST -Body $body `
+            -WebSession $session -TimeoutSec 15 -UseBasicParsing `
+            -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop | Out-Null
         return $true
     } catch {
         Write-Log "ERROR: $($_.Exception.Message)"
@@ -222,20 +196,14 @@ function Invoke-PortalLogin {
 
 # ===================== COMMANDS =====================
 
-# --- Setup: First-time credential entry ---
 function Invoke-Setup {
-    $result = Prompt-Credentials
-    if ($result) {
-        Write-Host "  Now run with -Install to enable auto-login." -ForegroundColor Cyan
-    }
+    Prompt-Credentials | Out-Null
 }
 
-# --- Change Username ---
 function Invoke-ChangeUser {
     $creds = Load-Credentials
     $oldId = if ($creds) { $creds["SERAPH_ID"] } else { "(none)" }
-    Write-Host ""
-    Write-Host "  Current Seraph ID: $oldId"
+    Write-Host "`n  Current Seraph ID: $oldId"
     $newId = Read-Host "  New Seraph ID"
     if ([string]::IsNullOrWhiteSpace($newId)) { Write-Err "Cancelled."; return }
     $pass = if ($creds) { $creds["PASSWORD"] } else { "" }
@@ -249,48 +217,84 @@ function Invoke-ChangeUser {
     Write-Ok "Seraph ID updated to: $newId"
 }
 
-# --- Change Password ---
 function Invoke-ChangePassword {
     $creds = Load-Credentials
-    $id = if ($creds) { $creds["SERAPH_ID"] } else { "" }
-    if (-not $id) {
-        Write-Err "No credentials found. Run with -Setup first."
-        return
-    }
-    Write-Host ""
-    Write-Host "  Seraph ID: $id"
+    if (-not $creds) { Write-Err "No credentials. Run with -Setup first."; return }
+    Write-Host "`n  Seraph ID: $($creds['SERAPH_ID'])"
     $secPass = Read-Host "  New Password" -AsSecureString
     $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass)
     $pass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     if ([string]::IsNullOrWhiteSpace($pass)) { Write-Err "Cancelled."; return }
-    Save-Credentials -SeraphId $id -Password $pass
+    Save-Credentials -SeraphId $creds["SERAPH_ID"] -Password $pass
     Write-Ok "Password updated!"
 }
 
-# --- Install: Copy script + register tasks ---
+# --- Create VBS silent launcher (no cmd window flash) ---
+function Create-SilentLauncher {
+    param([string]$ScriptPath, [string]$ExtraArgs)
+    $cmd = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""$ScriptPath"" $ExtraArgs"
+    $vbs = "Set objShell = CreateObject(""WScript.Shell"")`r`nobjShell.Run ""$cmd"", 0, False"
+    Set-Content -Path $VBS_LAUNCHER -Value $vbs -Encoding ASCII
+}
+
+# --- Disable Windows captive portal browser popup ---
+function Disable-CaptivePortalPopup {
+    try {
+        # This stops Windows from auto-opening browser when it detects captive portal
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet"
+        Set-ItemProperty -Path $regPath -Name "EnableActiveProbing" -Value 0 -Type DWord -ErrorAction Stop
+        Write-Log "Disabled Windows captive portal browser popup"
+    } catch {
+        Write-Log "Could not disable captive portal popup (need admin): $($_.Exception.Message)"
+    }
+}
+
+# --- Re-enable Windows captive portal browser popup ---
+function Enable-CaptivePortalPopup {
+    try {
+        $regPath = "HKLM:\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet"
+        Set-ItemProperty -Path $regPath -Name "EnableActiveProbing" -Value 1 -Type DWord -ErrorAction Stop
+    } catch {}
+}
+
+# --- Install ---
 function Install-Task {
-    # Ensure credentials exist
     $creds = Load-Credentials
     if (-not $creds) {
-        Write-Host ""
-        Write-Warn "No credentials found. Let's set them up first."
+        Write-Warn "No credentials found. Let's set them up."
         $result = Prompt-Credentials
         if (-not $result) { Write-Err "Install cancelled."; exit 1 }
     }
 
-    # Copy script to install directory
+    # Create install directory and copy script
     if (-not (Test-Path $INSTALL_DIR)) { New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null }
-    $sourceScript = $MyInvocation.ScriptName
-    if (-not $sourceScript) { $sourceScript = $PSCommandPath }
-    if ($sourceScript -and (Test-Path $sourceScript) -and ($sourceScript -ne $SCRIPT_DEST)) {
-        Copy-Item $sourceScript $SCRIPT_DEST -Force
-    }
-    $runScript = if (Test-Path $SCRIPT_DEST) { $SCRIPT_DEST } else { $sourceScript }
+    $src = $MyInvocation.ScriptName
+    if (-not $src) { $src = $PSCommandPath }
+    if ($src -and (Test-Path $src) -and ($src -ne $SCRIPT_DEST)) { Copy-Item $src $SCRIPT_DEST -Force }
+    $runScript = if (Test-Path $SCRIPT_DEST) { $SCRIPT_DEST } else { $src }
 
-    # Task 1: Background loop at logon
-    $argLoop = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runScript`" -Loop"
-    $actionLoop = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $argLoop
+    # Create VBS silent launcher (prevents cmd window flash)
+    Create-SilentLauncher -ScriptPath $runScript -ExtraArgs "-Loop"
+
+    # Create a second VBS for single-run (event trigger)
+    $vbsEvent = Join-Path $INSTALL_DIR "silent-event.vbs"
+    $vbsContent = @"
+Set objShell = CreateObject("WScript.Shell")
+objShell.Run "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File ""$runScript""", 0, False
+"@
+    Set-Content -Path $vbsEvent -Value $vbsContent -Encoding ASCII
+
+    # Disable Windows captive portal browser popup
+    Disable-CaptivePortalPopup
+
+    # Stop old tasks
+    Stop-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue
+    Unregister-ScheduledTask -TaskName $TASK_NAME_EVENT -Confirm:$false -ErrorAction SilentlyContinue
+
+    # Task 1: Background loop via VBS (completely silent, no window)
+    $actionLoop = New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$VBS_LAUNCHER`""
     $triggerLogon = New-ScheduledTaskTrigger -AtLogOn
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -300,8 +304,7 @@ function Install-Task {
         -Action $actionLoop -Trigger $triggerLogon -Settings $settings `
         -Description "KU-WL auto-login background loop" -Force | Out-Null
 
-    # Task 2: WiFi event trigger (Event 8001 = WiFi connected, 10000 = network connected)
-    $argOnce = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runScript`""
+    # Task 2: WiFi event trigger via VBS (completely silent)
     $taskXml = @"
 <?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
@@ -309,12 +312,12 @@ function Install-Task {
     <EventTrigger>
       <Enabled>true</Enabled>
       <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-WLAN-AutoConfig/Operational"&gt;&lt;Select Path="Microsoft-Windows-WLAN-AutoConfig/Operational"&gt;*[System[(EventID=8001)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
-      <Delay>PT5S</Delay>
+      <Delay>PT3S</Delay>
     </EventTrigger>
     <EventTrigger>
       <Enabled>true</Enabled>
       <Subscription>&lt;QueryList&gt;&lt;Query Id="0" Path="Microsoft-Windows-NetworkProfile/Operational"&gt;&lt;Select Path="Microsoft-Windows-NetworkProfile/Operational"&gt;*[System[(EventID=10000)]]&lt;/Select&gt;&lt;/Query&gt;&lt;/QueryList&gt;</Subscription>
-      <Delay>PT5S</Delay>
+      <Delay>PT3S</Delay>
     </EventTrigger>
   </Triggers>
   <Principals>
@@ -329,22 +332,21 @@ function Install-Task {
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <AllowHardTerminate>true</AllowHardTerminate>
     <StartWhenAvailable>true</StartWhenAvailable>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
     <Enabled>true</Enabled>
     <Hidden>true</Hidden>
     <ExecutionTimeLimit>PT5M</ExecutionTimeLimit>
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>powershell.exe</Command>
-      <Arguments>$argOnce</Arguments>
+      <Command>wscript.exe</Command>
+      <Arguments>"$vbsEvent"</Arguments>
     </Exec>
   </Actions>
 </Task>
 "@
     Register-ScheduledTask -TaskName $TASK_NAME_EVENT -Xml $taskXml -Force | Out-Null
 
-    # Start the loop NOW
+    # Start loop NOW
     Start-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 
     Write-Log "INSTALLED"
@@ -352,11 +354,11 @@ function Install-Task {
     Write-Host "  ========================================" -ForegroundColor Green
     Write-Host "  KU-WL Auto Login - INSTALLED" -ForegroundColor Green
     Write-Host "  ========================================" -ForegroundColor Green
-    Write-Host "  Script  : $runScript" -ForegroundColor White
-    Write-Host "  Creds   : $ENV_FILE (hidden)" -ForegroundColor White
-    Write-Host "  Logs    : $LOG_FILE" -ForegroundColor White
     Write-Host ""
-    Write-Host "  Auto-login is now ACTIVE." -ForegroundColor Cyan
+    Write-Ok "Auto-login is ACTIVE."
+    Write-Ok "No windows will pop up."
+    Write-Ok "No browser will open for login."
+    Write-Host ""
     Write-Host "  Connect to KU-WL and it just works!" -ForegroundColor Cyan
     Write-Host "  ========================================" -ForegroundColor Green
     Write-Host ""
@@ -367,9 +369,11 @@ function Uninstall-Task {
     Stop-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $TASK_NAME_EVENT -Confirm:$false -ErrorAction SilentlyContinue
+    # Re-enable Windows captive portal popup
+    Enable-CaptivePortalPopup
     Write-Host ""
-    Write-Warn "Tasks removed. Your credentials are still saved."
-    Write-Host "  To remove everything: Remove-Item '$INSTALL_DIR' -Recurse -Force"
+    Write-Warn "Uninstalled. Captive portal browser popup restored."
+    Write-Host "  To remove all data: Remove-Item '$INSTALL_DIR' -Recurse -Force"
     Write-Host ""
 }
 
@@ -377,36 +381,28 @@ function Uninstall-Task {
 function Show-Status {
     Write-Host ""
     Write-Host "  === KU-WL Auto Login ===" -ForegroundColor Cyan
-    $ssid = Get-WiFiSSID
-    $inet = Test-InternetAccess
+    $ssid = Get-WiFiSSID; $inet = Test-InternetAccess
     Write-Info "SSID       : $( if ($ssid) { $ssid } else { 'Not connected' } )"
     Write-Info "Internet   : $( if ($inet) { 'Working' } else { 'No access' } )"
-    Write-Info "Credentials: $( if (Load-Credentials) { 'Saved' } else { 'NOT SET - run with -Setup' } )"
+    Write-Info "Credentials: $( if (Load-Credentials) { 'Saved' } else { 'NOT SET' } )"
     $t1 = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
     $t2 = Get-ScheduledTask -TaskName $TASK_NAME_EVENT -ErrorAction SilentlyContinue
     Write-Info "Loop task  : $( if ($t1) { $t1.State } else { 'Not installed' } )"
     Write-Info "Event task : $( if ($t2) { $t2.State } else { 'Not installed' } )"
     if (Test-Path $LOG_FILE) {
-        Write-Host ""
-        Write-Host "  Recent logs:" -ForegroundColor Gray
-        Get-Content $LOG_FILE -Tail 8 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
+        Write-Host ""; Write-Host "  Recent:" -ForegroundColor Gray
+        Get-Content $LOG_FILE -Tail 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
     }
     Write-Host ""
 }
 
-# --- Show Logs ---
 function Show-Logs {
-    if (Test-Path $LOG_FILE) {
-        Get-Content $LOG_FILE -Tail 30
-    } else {
-        Write-Warn "No logs yet."
-    }
+    if (Test-Path $LOG_FILE) { Get-Content $LOG_FILE -Tail 30 }
+    else { Write-Warn "No logs yet." }
 }
 
-# --- Test mode ---
 function Invoke-TestMode {
-    Write-Host ""
-    Write-Host "  === Debug Test ===" -ForegroundColor Yellow
+    Write-Host "`n  === Debug ===" -ForegroundColor Yellow
     Write-Info "SSID: $(Get-WiFiSSID)"
     Write-Info "Internet: $(Test-InternetAccess)"
     Enable-SSLBypass
@@ -416,41 +412,27 @@ function Invoke-TestMode {
         try {
             $page = Invoke-WebRequest -Uri $url -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
             Write-Info "Page: $($page.Content.Length) bytes"
-            $hiddens = [regex]::Matches($page.Content, '<input[^>]*type=[''"]hidden[''"][^>]*>')
-            foreach ($h in $hiddens) { Write-Host "  Hidden: $($h.Value)" -ForegroundColor Gray }
-        } catch { Write-Err "ERROR: $($_.Exception.Message)" }
+        } catch { Write-Err "$($_.Exception.Message)" }
     }
-    Write-Host ""
     $creds = Load-Credentials
-    if (-not $creds) { Write-Err "No credentials. Run with -Setup"; return }
+    if (-not $creds) { Write-Err "No credentials."; return }
     Write-Info "Logging in..."
     Invoke-PortalLogin -Creds $creds
     Start-Sleep -Seconds 4
     $inet = Test-InternetAccess
-    Write-Host "  Internet after login: $inet" -ForegroundColor $(if ($inet) { 'Green' } else { 'Red' })
+    Write-Host "  Result: $inet" -ForegroundColor $(if ($inet) { 'Green' } else { 'Red' })
 }
 
 # ===================== ENTRY POINT =====================
 
-# Show help if no args
 if (-not ($Install -or $Uninstall -or $Setup -or $ChangeUser -or $ChangePassword `
     -or $Loop -or $Status -or $Test -or $Logs)) {
-    Write-Host ""
-    Write-Host "  KU-WL Auto Login" -ForegroundColor Cyan
-    Write-Host "  Auto-login to Karunya University Wi-Fi" -ForegroundColor Cyan
-    Write-Host ""
-    Write-Host "  FIRST TIME:" -ForegroundColor Yellow
-    Write-Host "    .\ku-wl-auto-login.ps1 -Setup       Save your Seraph ID & password"
-    Write-Host "    .\ku-wl-auto-login.ps1 -Install     Enable auto-login (run as Admin)"
-    Write-Host ""
-    Write-Host "  MANAGE:" -ForegroundColor Yellow
-    Write-Host "    .\ku-wl-auto-login.ps1 -ChangeUser      Change Seraph ID"
-    Write-Host "    .\ku-wl-auto-login.ps1 -ChangePassword   Change password"
-    Write-Host "    .\ku-wl-auto-login.ps1 -Status           Check status"
-    Write-Host "    .\ku-wl-auto-login.ps1 -Logs             View recent logs"
-    Write-Host "    .\ku-wl-auto-login.ps1 -Test             Debug test"
-    Write-Host "    .\ku-wl-auto-login.ps1 -Uninstall        Remove auto-login"
-    Write-Host ""
+    Write-Host "`n  KU-WL Auto Login" -ForegroundColor Cyan
+    Write-Host "  .\ku-wl-auto-login.ps1 -Install         (first time, run as Admin)"
+    Write-Host "  .\ku-wl-auto-login.ps1 -ChangeUser       Change Seraph ID"
+    Write-Host "  .\ku-wl-auto-login.ps1 -ChangePassword   Change password"
+    Write-Host "  .\ku-wl-auto-login.ps1 -Status           Check status"
+    Write-Host "  .\ku-wl-auto-login.ps1 -Uninstall        Remove`n"
     exit 0
 }
 
@@ -472,13 +454,11 @@ if ($Loop) {
             $ssid = Get-WiFiSSID
             $internet = $false
             if ($ssid -eq $SSID) { $internet = Test-InternetAccess }
-
             $state = "ssid=$ssid|inet=$internet"
             if ($state -ne $lastState) {
                 Write-Log "State: SSID='$ssid' Internet=$internet"
                 $lastState = $state
             }
-
             if ($ssid -eq $SSID -and -not $internet) {
                 $creds = Load-Credentials
                 if ($creds) {
@@ -488,14 +468,10 @@ if ($Loop) {
                     if (Test-InternetAccess) {
                         Write-Log "SUCCESS!"
                         $lastState = "ssid=$SSID|inet=True"
-                    } else {
-                        Write-Log "Failed. Retrying next cycle."
-                    }
+                    } else { Write-Log "Failed. Retrying." }
                 }
             }
-        } catch {
-            try { Write-Log "LOOP ERROR: $($_.Exception.Message)" } catch {}
-        }
+        } catch { try { Write-Log "ERROR: $($_.Exception.Message)" } catch {} }
         Start-Sleep -Seconds $Interval
     }
 }
