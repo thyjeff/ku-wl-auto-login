@@ -1,0 +1,14 @@
+# Credentials - NEVER commit
+.env
+
+# Logs
+*.log
+logs/
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
