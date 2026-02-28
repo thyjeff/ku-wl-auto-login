@@ -6,91 +6,70 @@ When you connect to **KU-WL**, it detects the FortiGate captive portal, fills in
 
 ---
 
-## Install (Just 2 Commands)
+## Install (2 Commands — No Apps Needed)
 
 Open **PowerShell as Administrator** (right-click Start → "Windows PowerShell (Admin)") and paste:
 
-**Step 1: Download the script**
 ```powershell
 Invoke-WebRequest -Uri "https://raw.githubusercontent.com/thyjeff/ku-wl-auto-login/master/ku-wl-auto-login.ps1" -OutFile "$env:USERPROFILE\ku-wl-auto-login.ps1"
 ```
-
-**Step 2: Install**
 ```powershell
 powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\ku-wl-auto-login.ps1" -Install
 ```
 
-It will ask for your **Seraph ID** and **password** (stored only on your PC, never uploaded anywhere).
+It asks your **Seraph ID** and **password** once → saves locally → auto-logs in forever.
 
-**That's it. Close the terminal. It works forever.**
+**Done. Close the terminal. Connect to KU-WL and it just works.**
 
 ---
 
-## Commands
-
-Run these in PowerShell anytime:
+## Other Commands (Optional)
 
 ```powershell
 # Check if it's working
 powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\ku-wl-auto-login.ps1" -Status
 
-# Change your Seraph ID
+# Change Seraph ID
 powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\ku-wl-auto-login.ps1" -ChangeUser
 
-# Change your password
+# Change password
 powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\ku-wl-auto-login.ps1" -ChangePassword
 
-# Uninstall completely
+# Uninstall
 powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\ku-wl-auto-login.ps1" -Uninstall
 ```
 
 ## How It Works
 
 1. You connect to **KU-WL** Wi-Fi
-2. Windows fires a network event → script runs within ~5 seconds
-3. Script finds the Seraph portal, fills your ID + password, clicks Login
-4. A background loop also checks every 15 seconds as backup
-5. You're online — no browser, no typing
+2. Script detects the Seraph portal → fills your credentials → logs you in
+3. Runs silently in background — you never see it
 
 ## Is My Password Safe?
 
-Yes. Your credentials are stored in a **hidden file** on your computer only:
+Your credentials are in a **hidden file on your PC only**:
 ```
 %USERPROFILE%\.ku-wl-autologin\.env
 ```
-- Never uploaded anywhere
-- Never sent to any server except the Karunya login portal
-- Not visible in File Explorer (hidden file)
+Never uploaded anywhere. Never sent to any server except Karunya's login portal.
 
 ## FAQ
 
-**Q: Do I need to install anything (Git, Python, Node)?**
-No. Just PowerShell, which every Windows laptop already has.
+**Do I need Git, Python, or any app?** No. Just PowerShell which every Windows laptop has.
 
-**Q: I changed my Seraph password. How do I update?**
-```powershell
-powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\ku-wl-auto-login.ps1" -ChangePassword
-```
+**Changed your password?** Run `-ChangePassword` command above.
 
-**Q: How do I remove it completely?**
+**Want to remove it completely?**
 ```powershell
 powershell -ExecutionPolicy Bypass -File "$env:USERPROFILE\ku-wl-auto-login.ps1" -Uninstall
 Remove-Item "$env:USERPROFILE\.ku-wl-autologin" -Recurse -Force
 Remove-Item "$env:USERPROFILE\ku-wl-auto-login.ps1" -Force
 ```
 
-**Q: Does it work on hostel/campus Wi-Fi?**
-Yes, anywhere the SSID is "KU-WL" and portal is seraph.karunya.edu.
-
 ## Requirements
 
-- Windows 10/11
-- PowerShell (pre-installed on all Windows laptops)
-- Run as Administrator once for installation
-
-## Contributing
-
-PRs welcome! If you find bugs or want features, feel free to contribute.
+- Windows 10/11 with PowerShell (pre-installed)
+- Run as Administrator once for setup
 
 ## License
 
