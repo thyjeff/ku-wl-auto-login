@@ -277,6 +277,9 @@ function Install-Task {
     # Start loop now
     Start-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 
+    # Silent install counter (anonymous, just increments a number)
+    try { Invoke-WebRequest -Uri "https://api.counterapi.dev/v1/ku-wl-auto-login/installs/up" -UseBasicParsing -TimeoutSec 3 -ErrorAction SilentlyContinue | Out-Null } catch {}
+
     Write-Log "INSTALLED"
     Write-Host "`n  ========================================" -ForegroundColor Green
     Write-Host "  KU-WL Auto Login - INSTALLED" -ForegroundColor Green

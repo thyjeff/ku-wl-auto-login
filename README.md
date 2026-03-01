@@ -1,5 +1,7 @@
 # KU-WL Auto Login 🔐
 
+![Installs](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fapi.counterapi.dev%2Fv1%2Fku-wl-auto-login%2Finstalls&query=%24.count&label=installs&color=brightgreen&style=flat-square)
+
 **Tired of logging into Karunya Wi-Fi every single day?** This script does it for you — automatically.
 
 When you connect to **KU-WL**, it detects the FortiGate captive portal, fills in your Seraph ID, and logs you in within seconds. No browser needed.
