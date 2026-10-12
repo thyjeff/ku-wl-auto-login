@@ -10,6 +10,11 @@ param(
     [switch]$Setup,
     [switch]$ChangeUser,
     [switch]$ChangePassword,
+    [switch]$AddBackup,
+    [switch]$SwitchAccount,
+    [switch]$Logout,
+    [switch]$Keepalive,
+    [switch]$Update,
     [switch]$Loop,
     [switch]$Status,
     [switch]$Test,
@@ -23,6 +28,7 @@ $TASK_NAME       = "KU-WL-AutoLogin"
 $TASK_NAME_EVENT = "KU-WL-AutoLogin-WiFiEvent"
 $INSTALL_DIR     = Join-Path $env:USERPROFILE ".ku-wl-autologin"
 $ENV_FILE        = Join-Path $INSTALL_DIR ".env"
+$SESSION_FILE    = Join-Path $INSTALL_DIR "session.json"
 $LOG_DIR         = Join-Path $INSTALL_DIR "logs"
 $LOG_FILE        = Join-Path $LOG_DIR "autologin.log"
 $SCRIPT_DEST     = Join-Path $INSTALL_DIR "ku-wl-auto-login.ps1"
@@ -32,6 +38,13 @@ $SCRIPT_DEST     = Join-Path $INSTALL_DIR "ku-wl-auto-login.ps1"
 function Write-Log {
     param([string]$Msg)
     if (-not (Test-Path $LOG_DIR)) { New-Item -ItemType Directory -Path $LOG_DIR -Force | Out-Null }
+    # Rotate log if larger than 1MB
+    if ((Test-Path $LOG_FILE) -and ((Get-Item $LOG_FILE).Length -gt 1048576)) {
+        try {
+            $lines = Get-Content $LOG_FILE -Tail 500
+            Set-Content -Path $LOG_FILE -Value $lines -Encoding UTF8
+        } catch {}
+    }
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     "$ts | $Msg" | Add-Content -Path $LOG_FILE -Encoding UTF8
 }
@@ -54,6 +67,13 @@ function Get-WiFiSSID {
 }
 
 function Test-InternetAccess {
+    try {
+        # Quick 204 check
+        $r1 = Invoke-WebRequest -Uri "http://connectivitycheck.gstatic.com/generate_204" `
+              -TimeoutSec 4 -UseBasicParsing -ErrorAction SilentlyContinue
+        if ($r1.StatusCode -eq 204) { return $true }
+    } catch {}
+
     try {
         $r = Invoke-WebRequest -Uri "http://www.msftconnecttest.com/connecttest.txt" `
              -TimeoutSec 5 -UseBasicParsing -ErrorAction Stop
@@ -79,7 +99,7 @@ public class SSLBypass {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 }
 
-# ===================== CREDENTIALS =====================
+# ===================== CREDENTIALS & SESSIONS =====================
 
 function Load-Credentials {
     if (-not (Test-Path $ENV_FILE)) { return $null }
@@ -96,10 +116,43 @@ function Load-Credentials {
 }
 
 function Save-Credentials {
-    param([string]$SeraphId, [string]$Password)
+    param(
+        [string]$SeraphId,
+        [string]$Password,
+        [string]$BackupId = "",
+        [string]$BackupPassword = "",
+        [string]$AutoFailover = "1"
+    )
     if (-not (Test-Path $INSTALL_DIR)) { New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null }
-    Set-Content -Path $ENV_FILE -Value "# KU-WL Credentials (local only)`nSERAPH_ID=$SeraphId`nPASSWORD=$Password" -Encoding UTF8
+    $content = "# KU-WL Credentials (local only)`nSERAPH_ID=$SeraphId`nPASSWORD=$Password"
+    if ($BackupId -and $BackupPassword) {
+        $content += "`nBACKUP_SERAPH_ID=$BackupId`nBACKUP_PASSWORD=$BackupPassword`nAUTO_FAILOVER=$AutoFailover"
+    } elseif ($AutoFailover) {
+        $content += "`nAUTO_FAILOVER=$AutoFailover"
+    }
+    Set-Content -Path $ENV_FILE -Value $content -Encoding UTF8
     (Get-Item $ENV_FILE).Attributes = 'Hidden'
+}
+
+function Load-Session {
+    if (-not (Test-Path $SESSION_FILE)) { return $null }
+    try {
+        $raw = Get-Content $SESSION_FILE -Raw -Encoding UTF8
+        return ($raw | ConvertFrom-Json)
+    } catch { return $null }
+}
+
+function Save-Session {
+    param([string]$Token, [string]$SeraphId)
+    if (-not (Test-Path $INSTALL_DIR)) { New-Item -ItemType Directory -Path $INSTALL_DIR -Force | Out-Null }
+    $sess = @{
+        token         = $Token
+        keepalive_url = "$PORTAL_BASE/keepalive?$Token"
+        logout_url    = "$PORTAL_BASE/logout?$Token"
+        seraph_id     = $SeraphId
+        login_time    = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+    }
+    $sess | ConvertTo-Json | Set-Content -Path $SESSION_FILE -Encoding UTF8
 }
 
 function Prompt-Credentials {
@@ -115,7 +168,21 @@ function Prompt-Credentials {
     $pass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
     if ([string]::IsNullOrWhiteSpace($pass)) { Write-Err "Cancelled."; return $false }
-    Save-Credentials -SeraphId $id -Password $pass
+
+    $bId = ""
+    $bPass = ""
+    $addBak = Read-Host "`n  Do you want to add a backup ID for 8GB data limit failover? (y/n)"
+    if ($addBak -eq "y" -or $addBak -eq "Y") {
+        $bId = Read-Host "  Backup Seraph ID"
+        if (-not [string]::IsNullOrWhiteSpace($bId)) {
+            $bSecPass = Read-Host "  Backup Password" -AsSecureString
+            $bBstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($bSecPass)
+            $bPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bBstr)
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bBstr)
+        }
+    }
+
+    Save-Credentials -SeraphId $id -Password $pass -BackupId $bId -BackupPassword $bPass -AutoFailover "1"
     Write-Ok "Credentials saved!"
     return $true
 }
@@ -124,19 +191,21 @@ function Prompt-Credentials {
 
 function Get-CaptivePortalUrl {
     $urls = @(
-        "http://detectportal.firefox.com/canonical.html",
         "http://connectivitycheck.gstatic.com/generate_204",
+        "http://detectportal.firefox.com/canonical.html",
         "http://www.msftconnecttest.com/redirect",
+        "http://www.msftconnecttest.com/connecttest.txt",
         "http://captive.apple.com/hotspot-detect.html"
     )
     foreach ($u in $urls) {
         try {
-            $r = Invoke-WebRequest -Uri $u -TimeoutSec 6 -UseBasicParsing -MaximumRedirection 5 -ErrorAction Stop
+            $r = Invoke-WebRequest -Uri $u -TimeoutSec 5 -UseBasicParsing -MaximumRedirection 5 -ErrorAction Stop
             $final = $r.BaseResponse.ResponseUri.ToString()
             if ($final -match "seraph\.karunya\.edu") { return $final }
             if ($r.Content -match "(https?://seraph\.karunya\.edu[^\s""'<>]+)") { return $Matches[1] }
         } catch {
-            try { $loc = $_.Exception.Response.Headers["Location"]
+            try {
+                $loc = $_.Exception.Response.Headers["Location"]
                 if ($loc -and $loc -match "seraph\.karunya\.edu") { return $loc }
             } catch {}
         }
@@ -149,7 +218,7 @@ function Invoke-PortalLogin {
     Enable-SSLBypass
     $portalUrl = Get-CaptivePortalUrl
     if (-not $portalUrl) { $portalUrl = $PORTAL_BASE }
-    Write-Log "Portal: $portalUrl"
+    Write-Log "Portal URL: $portalUrl"
     try {
         $session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
         $page = Invoke-WebRequest -Uri $portalUrl -WebSession $session -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
@@ -173,8 +242,22 @@ function Invoke-PortalLogin {
             if ($m.Value -match 'value=[''"]([^''"]*)[''"]') { $fv = $Matches[1] }
             if ($fn -and -not $body.ContainsKey($fn)) { $body[$fn] = $fv }
         }
-        Write-Log "POST -> $postUrl"
-        Invoke-WebRequest -Uri $postUrl -Method POST -Body $body -WebSession $session -TimeoutSec 15 -UseBasicParsing -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop | Out-Null
+        Write-Log "POST -> $postUrl ($($Creds['SERAPH_ID']))"
+        $resp = Invoke-WebRequest -Uri $postUrl -Method POST -Body $body -WebSession $session `
+                -TimeoutSec 15 -UseBasicParsing -ContentType "application/x-www-form-urlencoded" -ErrorAction Stop
+
+        # Capture and save keepalive/logout token
+        $token = $null
+        if ($resp.Content -match "(?:keepalive|logout)\?([a-f0-9]+)") {
+            $token = $Matches[1]
+        } elseif ($resp.Headers["Location"] -match "(?:keepalive|logout)\?([a-f0-9]+)") {
+            $token = $Matches[1]
+        }
+        if ($token) {
+            Save-Session -Token $token -SeraphId $Creds["SERAPH_ID"]
+            Write-Log "Keepalive session active: $PORTAL_BASE/keepalive?$token"
+        }
+
         return $true
     } catch {
         Write-Log "ERROR: $($_.Exception.Message)"
@@ -182,7 +265,7 @@ function Invoke-PortalLogin {
     }
 }
 
-# ===================== INSTALL =====================
+# ===================== INSTALL & TASKS =====================
 
 function Disable-CaptivePortalPopup {
     try {
@@ -213,10 +296,8 @@ function Install-Task {
     Stop-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $TASK_NAME -Confirm:$false -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $TASK_NAME_EVENT -Confirm:$false -ErrorAction SilentlyContinue
-    # Clean old VBS files if any
     Remove-Item (Join-Path $INSTALL_DIR "*.vbs") -Force -ErrorAction SilentlyContinue
 
-    # Both tasks use full XML so paths are correct for THIS user
     $psArgs = "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$runScript`""
     $psArgsLoop = "$psArgs -Loop"
 
@@ -277,7 +358,7 @@ function Install-Task {
     # Start loop now
     Start-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
 
-    # Silent install counter (anonymous, just increments a number)
+    # Silent install counter
     try { Invoke-WebRequest -Uri "https://api.counterapi.dev/v1/ku-wl-auto-login/installs/up" -UseBasicParsing -TimeoutSec 3 -ErrorAction SilentlyContinue | Out-Null } catch {}
 
     Write-Log "INSTALLED"
@@ -288,7 +369,7 @@ function Install-Task {
     Write-Host "  Connect to KU-WL and it just works!`n" -ForegroundColor Cyan
 }
 
-# ===================== OTHER COMMANDS =====================
+# ===================== USER COMMANDS =====================
 
 function Invoke-Setup { Prompt-Credentials | Out-Null }
 
@@ -305,7 +386,9 @@ function Invoke-ChangeUser {
         $pass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b)
         [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b)
     }
-    Save-Credentials -SeraphId $newId -Password $pass
+    Save-Credentials -SeraphId $newId -Password $pass `
+                     -BackupId ($creds["BACKUP_SERAPH_ID"] ?? "") `
+                     -BackupPassword ($creds["BACKUP_PASSWORD"] ?? "")
     Write-Ok "Seraph ID updated to: $newId"
 }
 
@@ -318,8 +401,124 @@ function Invoke-ChangePassword {
     $pass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($b)
     [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($b)
     if ([string]::IsNullOrWhiteSpace($pass)) { Write-Err "Cancelled."; return }
-    Save-Credentials -SeraphId $creds["SERAPH_ID"] -Password $pass
+    Save-Credentials -SeraphId $creds["SERAPH_ID"] -Password $pass `
+                     -BackupId ($creds["BACKUP_SERAPH_ID"] ?? "") `
+                     -BackupPassword ($creds["BACKUP_PASSWORD"] ?? "")
     Write-Ok "Password updated!"
+}
+
+function Invoke-AddBackup {
+    $creds = Load-Credentials
+    if (-not $creds) { Write-Err "No primary credentials found. Run -Install or -Setup first."; return }
+    Write-Host "`n  === 8GB Quota / Backup Account Setup ===" -ForegroundColor Cyan
+    Write-Host "  When your 8GB daily limit is reached, auto-login will"
+    Write-Host "  automatically roll over to this backup student account.`n"
+    $bId = Read-Host "  Backup Seraph ID (e.g. URK25XX0000)"
+    if ([string]::IsNullOrWhiteSpace($bId)) { Write-Err "Cancelled."; return }
+    $secPass = Read-Host "  Backup Password" -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass)
+    $bPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    if ([string]::IsNullOrWhiteSpace($bPass)) { Write-Err "Cancelled."; return }
+
+    Save-Credentials -SeraphId $creds["SERAPH_ID"] -Password $creds["PASSWORD"] `
+                     -BackupId $bId -BackupPassword $bPass -AutoFailover "1"
+    Write-Ok "Backup account $bId saved with Auto-Failover enabled!"
+    Write-Info "When daily 8GB runs out on $($creds['SERAPH_ID']), it automatically switches to $bId."
+}
+
+function Invoke-Logout {
+    Enable-SSLBypass
+    $sess = Load-Session
+    $token = if ($sess) { $sess["token"] } else { $null }
+    if ($token) {
+        $logoutUrl = "$PORTAL_BASE/logout?$token"
+        try {
+            Invoke-WebRequest -Uri $logoutUrl -TimeoutSec 6 -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null
+            Write-Ok "Logged out active session for $($sess['seraph_id']) ($token)."
+            Remove-Item $SESSION_FILE -Force -ErrorAction SilentlyContinue
+        } catch {
+            Write-Warn "Logout request sent."
+        }
+    } else {
+        Write-Warn "No active session token found. Session may already be expired or offline."
+    }
+}
+
+function Invoke-Keepalive {
+    $sess = Load-Session
+    $kurl = if ($sess) { $sess["keepalive_url"] } else { $null }
+    if ($kurl) {
+        Write-Ok "Active Keepalive URL: $kurl"
+        Write-Info "Opening session dashboard in default browser..."
+        Start-Process $kurl
+    } else {
+        Write-Warn "No active keepalive session saved yet. Connect to KU-WL and log in first."
+    }
+}
+
+function Invoke-SwitchAccount {
+    $creds = Load-Credentials
+    if (-not $creds) { Write-Err "No credentials found. Run -Setup first."; return }
+    Write-Host "`n  === Switch Active Seraph Account ===" -ForegroundColor Cyan
+    Write-Info "Active Account : $($creds['SERAPH_ID'])"
+    $backupId = if ($creds["BACKUP_SERAPH_ID"]) { $creds["BACKUP_SERAPH_ID"] } else { "(none)" }
+    Write-Info "Backup Account : $backupId"
+
+    if ($creds["BACKUP_SERAPH_ID"] -and $creds["BACKUP_PASSWORD"]) {
+        $choice = Read-Host "`n  Switch to backup account $backupId now? (y/n/new)"
+        if ($choice -eq "y" -or $choice -eq "Y") {
+            Save-Credentials -SeraphId $creds["BACKUP_SERAPH_ID"] -Password $creds["BACKUP_PASSWORD"] `
+                             -BackupId $creds["SERAPH_ID"] -BackupPassword $creds["PASSWORD"] `
+                             -AutoFailover ($creds["AUTO_FAILOVER"] ?? "1")
+            Write-Ok "Active account swapped to $backupId! Terminating old session..."
+            Invoke-Logout
+            Write-Info "Logging in with $backupId..."
+            Invoke-TestMode
+            return
+        }
+    }
+
+    $newId = Read-Host "  Enter new Seraph ID to activate"
+    if ([string]::IsNullOrWhiteSpace($newId)) { Write-Err "Cancelled."; return }
+    $secPass = Read-Host "  Password" -AsSecureString
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secPass)
+    $pass = [Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr)
+    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+    if ([string]::IsNullOrWhiteSpace($pass)) { Write-Err "Cancelled."; return }
+
+    Save-Credentials -SeraphId $newId -Password $pass `
+                     -BackupId ($creds["BACKUP_SERAPH_ID"] ?? "") `
+                     -BackupPassword ($creds["BACKUP_PASSWORD"] ?? "")
+    Write-Ok "Switched to $newId! Terminating old session and logging in..."
+    Invoke-Logout
+    Invoke-TestMode
+}
+
+function Invoke-Update {
+    Write-Host "`n  KU-WL Auto Login - Checking for updates..." -ForegroundColor Cyan
+    $rawUrl = "https://raw.githubusercontent.com/thyjeff/ku-wl-auto-login/master/ku-wl-auto-login.ps1"
+    try {
+        $tmp = Join-Path $env:TEMP "ku-wl-auto-login-update.ps1"
+        Invoke-WebRequest -Uri $rawUrl -OutFile $tmp -TimeoutSec 15 -UseBasicParsing -ErrorAction Stop
+        if (Test-Path $SCRIPT_DEST) {
+            Copy-Item $tmp $SCRIPT_DEST -Force
+        }
+        $userScript = Join-Path $env:USERPROFILE "ku-wl-auto-login.ps1"
+        if (Test-Path $userScript) {
+            Copy-Item $tmp $userScript -Force
+        }
+        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+
+        # Restart scheduled task
+        Stop-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
+        Start-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
+
+        Write-Ok "Updated successfully to the latest version!"
+        Write-Host "  Background auto-login daemon restarted with newest features.`n" -ForegroundColor Green
+    } catch {
+        Write-Err "Update failed: $($_.Exception.Message)"
+    }
 }
 
 function Uninstall-Task {
@@ -336,56 +535,82 @@ function Uninstall-Task {
 function Show-Status {
     Write-Host "`n  === KU-WL Auto Login ===" -ForegroundColor Cyan
     $ssid = Get-WiFiSSID; $inet = Test-InternetAccess
-    Write-Info "SSID       : $(if ($ssid) {$ssid} else {'Not connected'})"
-    Write-Info "Internet   : $(if ($inet) {'Working'} else {'No access'})"
-    Write-Info "Credentials: $(if (Load-Credentials) {'Saved'} else {'NOT SET'})"
+    $creds = Load-Credentials
+    $sess = Load-Session
+
+    Write-Info "SSID           : $(if ($ssid) {$ssid} else {'Not connected'})"
+    Write-Info "Internet       : $(if ($inet) {'Working (Online)'} else {'No access / Quota Exceeded'})"
+    Write-Info "Active Account : $(if ($creds) {$creds['SERAPH_ID']} else {'NOT SET'})"
+    $backupText = if ($creds -and $creds['BACKUP_SERAPH_ID']) { "$($creds['BACKUP_SERAPH_ID']) (Auto-Failover ON)" } else { "None (run -AddBackup to set)" }
+    Write-Info "Backup Account : $backupText"
+
+    $kurl = if ($sess) { $sess["keepalive_url"] } else { "(captured on next login)" }
+    Write-Info "Keepalive URL  : $kurl"
+
     $t1 = Get-ScheduledTask -TaskName $TASK_NAME -ErrorAction SilentlyContinue
     $t2 = Get-ScheduledTask -TaskName $TASK_NAME_EVENT -ErrorAction SilentlyContinue
-    Write-Info "Loop task  : $(if ($t1) {$t1.State} else {'Not installed'})"
-    Write-Info "Event task : $(if ($t2) {$t2.State} else {'Not installed'})"
+    Write-Info "Loop task      : $(if ($t1) {$t1.State} else {'Not installed'})"
+    Write-Info "Event task     : $(if ($t2) {$t2.State} else {'Not installed'})"
+
     if (Test-Path $LOG_FILE) {
-        Write-Host "`n  Recent:" -ForegroundColor Gray
+        Write-Host "`n  Recent Activity:" -ForegroundColor Gray
         Get-Content $LOG_FILE -Tail 5 | ForEach-Object { Write-Host "    $_" -ForegroundColor Gray }
     }
     Write-Host ""
 }
 
 function Show-Logs {
-    if (Test-Path $LOG_FILE) { Get-Content $LOG_FILE -Tail 30 }
+    if (Test-Path $LOG_FILE) { Get-Content $LOG_FILE -Tail 40 }
     else { Write-Warn "No logs yet." }
 }
 
 function Invoke-TestMode {
-    Write-Host "`n  === Debug ===" -ForegroundColor Yellow
+    Write-Host "`n  === Debug Test ===" -ForegroundColor Yellow
     Write-Info "SSID: $(Get-WiFiSSID)"
     Write-Info "Internet: $(Test-InternetAccess)"
     Enable-SSLBypass
     $url = Get-CaptivePortalUrl
-    Write-Info "Portal: $url"
+    Write-Info "Portal URL: $url"
     $creds = Load-Credentials
     if (-not $creds) { Write-Err "No credentials."; return }
-    Write-Info "Logging in..."
+    Write-Info "Logging in with $($creds['SERAPH_ID'])..."
     Invoke-PortalLogin -Creds $creds
     Start-Sleep -Seconds 4
     $inet = Test-InternetAccess
     Write-Host "  Result: $inet" -ForegroundColor $(if ($inet) {'Green'} else {'Red'})
+    $sess = Load-Session
+    if ($sess) {
+        Write-Info "Keepalive URL: $($sess['keepalive_url'])"
+    }
 }
 
 # ===================== ENTRY POINT =====================
 
-if (-not ($Install -or $Uninstall -or $Setup -or $ChangeUser -or $ChangePassword -or $Loop -or $Status -or $Test -or $Logs)) {
+if (-not ($Install -or $Uninstall -or $Setup -or $ChangeUser -or $ChangePassword -or `
+          $AddBackup -or $SwitchAccount -or $Logout -or $Keepalive -or $Update -or `
+          $Loop -or $Status -or $Test -or $Logs)) {
     Write-Host "`n  KU-WL Auto Login" -ForegroundColor Cyan
     Write-Host "  .\ku-wl-auto-login.ps1 -Install         First time setup (run as Admin)"
-    Write-Host "  .\ku-wl-auto-login.ps1 -ChangeUser       Change Seraph ID"
-    Write-Host "  .\ku-wl-auto-login.ps1 -ChangePassword   Change password"
-    Write-Host "  .\ku-wl-auto-login.ps1 -Status           Check status"
-    Write-Host "  .\ku-wl-auto-login.ps1 -Uninstall        Remove`n"
+    Write-Host "  .\ku-wl-auto-login.ps1 -Status          Check connection & session status"
+    Write-Host "  .\ku-wl-auto-login.ps1 -AddBackup       Add backup account for 8GB quota failover"
+    Write-Host "  .\ku-wl-auto-login.ps1 -SwitchAccount   Switch between active & backup accounts"
+    Write-Host "  .\ku-wl-auto-login.ps1 -Logout          Log out current FortiGate session"
+    Write-Host "  .\ku-wl-auto-login.ps1 -Keepalive       View/open active keepalive dashboard URL"
+    Write-Host "  .\ku-wl-auto-login.ps1 -Update          Update script to latest version"
+    Write-Host "  .\ku-wl-auto-login.ps1 -ChangeUser      Change primary Seraph ID"
+    Write-Host "  .\ku-wl-auto-login.ps1 -ChangePassword  Change primary password"
+    Write-Host "  .\ku-wl-auto-login.ps1 -Uninstall       Remove`n"
     exit 0
 }
 
 if ($Setup)          { Invoke-Setup; exit 0 }
 if ($ChangeUser)     { Invoke-ChangeUser; exit 0 }
 if ($ChangePassword) { Invoke-ChangePassword; exit 0 }
+if ($AddBackup)      { Invoke-AddBackup; exit 0 }
+if ($SwitchAccount)  { Invoke-SwitchAccount; exit 0 }
+if ($Logout)         { Invoke-Logout; exit 0 }
+if ($Keepalive)      { Invoke-Keepalive; exit 0 }
+if ($Update)         { Invoke-Update; exit 0 }
 if ($Install)        { Install-Task; exit 0 }
 if ($Uninstall)      { Uninstall-Task; exit 0 }
 if ($Status)         { Show-Status; exit 0 }
@@ -395,6 +620,8 @@ if ($Test)           { Invoke-TestMode; exit 0 }
 if ($Loop) {
     Write-Log "Loop started PID=$PID"
     $lastState = ""
+    $lastKeepalivePing = Get-Date
+
     while ($true) {
         try {
             $ssid = Get-WiFiSSID
@@ -405,16 +632,57 @@ if ($Loop) {
                 Write-Log "State: SSID='$ssid' Internet=$internet"
                 $lastState = $state
             }
+
             if ($ssid -eq $SSID -and -not $internet) {
+                # Dynamically re-read credentials on every attempt
                 $creds = Load-Credentials
                 if ($creds) {
-                    Write-Log "Logging in..."
+                    Write-Log "Logging in ($($creds['SERAPH_ID']))..."
                     Invoke-PortalLogin -Creds $creds | Out-Null
                     Start-Sleep -Seconds 4
+
                     if (Test-InternetAccess) {
-                        Write-Log "SUCCESS!"
+                        Write-Log "SUCCESS - Online with $($creds['SERAPH_ID'])"
                         $lastState = "ssid=$SSID|inet=True"
-                    } else { Write-Log "Failed. Retrying." }
+                        $lastKeepalivePing = Get-Date
+                    } else {
+                        # Internet restricted after login: check 8GB quota failover
+                        if ($creds["AUTO_FAILOVER"] -ne "0" -and $creds["BACKUP_SERAPH_ID"] -and $creds["BACKUP_PASSWORD"]) {
+                            Write-Log "Internet restricted after login for $($creds['SERAPH_ID']) (possible 8GB quota reached). Attempting auto-failover to backup account $($creds['BACKUP_SERAPH_ID'])..."
+                            $backupCreds = @{
+                                SERAPH_ID = $creds["BACKUP_SERAPH_ID"]
+                                PASSWORD  = $creds["BACKUP_PASSWORD"]
+                            }
+                            Invoke-PortalLogin -Creds $backupCreds | Out-Null
+                            Start-Sleep -Seconds 4
+
+                            if (Test-InternetAccess) {
+                                Write-Log "SUCCESS - Quota rollover successful! Online with backup account $($creds['BACKUP_SERAPH_ID'])"
+                                # Swap primary and backup in .env so working account remains active
+                                Save-Credentials -SeraphId $backupCreds["SERAPH_ID"] -Password $backupCreds["PASSWORD"] `
+                                                 -BackupId $creds["SERAPH_ID"] -BackupPassword $creds["PASSWORD"] `
+                                                 -AutoFailover "1"
+                                $lastState = "ssid=$SSID|inet=True"
+                                $lastKeepalivePing = Get-Date
+                            } else {
+                                Write-Log "Backup account login attempted but internet still restricted."
+                            }
+                        } else {
+                            Write-Log "Login failed or still restricted. Will retry."
+                        }
+                    }
+                }
+            } else {
+                # Online: periodically ping keepalive URL every ~10 minutes (600s)
+                if ($internet -and ((Get-Date) - $lastKeepalivePing).TotalSeconds -ge 600) {
+                    $lastKeepalivePing = Get-Date
+                    $sess = Load-Session
+                    if ($sess -and $sess["keepalive_url"]) {
+                        try {
+                            Invoke-WebRequest -Uri $sess["keepalive_url"] -TimeoutSec 6 -UseBasicParsing -ErrorAction SilentlyContinue | Out-Null
+                            Write-Log "Keepalive ping sent to $($sess['keepalive_url'])"
+                        } catch {}
+                    }
                 }
             }
         } catch { try { Write-Log "ERROR: $($_.Exception.Message)" } catch {} }
